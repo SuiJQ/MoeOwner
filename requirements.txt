@@ -1,0 +1,4 @@
+torch==2.6.0+cu124
+transformers==4.51.3
+# fastapi          # 仅 HTTP 接口服务时安装
+# uvicorn[standard] # 仅 HTTP 接口服务时安装
