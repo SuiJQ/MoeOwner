@@ -15,6 +15,7 @@
 | 📦 **混合缓存** | `cache_manager.py` | PagedAttention 物理块 + RadixAttention 哈希索引 |
 | ⏱ **统一调度器** | `scheduler.py` | Chunked Prefill + Decode 双 CUDA 流调度 |
 | 🚀 **入口** | `main.py` | 全局配置、模型注入、事件循环 |
+| 📖 **GGUF 加载** | `model_loader/` | 纯 Python GGUF v3 解析器 + PyTorch 原生量化适配 |
 
 ### 核心创新点
 
@@ -23,6 +24,9 @@
 - **复合键守卫 GC**：防止哈希重用导致的误删
 - **双 CUDA 流管线**：Prefill 流 + Decode 流，主线程统一同步（防死锁）
 - **引用计数驱逐**：每个匹配的自增引用，ref_count=0 时回收至空闲队列
+- **纯 Python GGUF 解析器**：仅依赖 struct+mmap+PyTorch，无需 llama-cpp-python
+- **原生量化加载**：Q4_0/Q8_0 纯 PyTorch bitwise 反量化，零 C 扩展
+- **KV Cache INT8 量化**：per-token 动态 INT8 压缩，显存降 50%
 
 ---
 
@@ -69,15 +73,39 @@ print(f'Cache stats: {cache.stats()}')
 "
 ```
 
-### 2. 启动推理服务
+### 2. GGUF 模型加载（纯 Python，零外部依赖）
 
 ```bash
-python main.py \
-  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-  --block-size 16 \
-  --hidden-size 4096 \
-  --verbose
+# 加载 GGUF 模型（自动检测 .gguf 后缀）
+python main.py --model /path/to/model.Q4_0.gguf
+
+# 或通过 --gguf 显式指定
+python main.py --gguf /path/to/model.Q4_0.gguf --block-size 32 --verbose
 ```
+
+GGUF 加载器架构：
+
+```
+model_loader/
+  __init__.py       — 公共 API: load_model(), GGUFFile
+  gguf_reader.py    — 底层 GGUF v3 解析 + 反量化 kernel
+  model_adapter.py  — 高层适配器 (GGUFModelAdapter)
+  README.md         — 完整文档
+```
+
+支持格式：
+
+| GGML 类型 | 状态 | 方式 |
+|-----------|------|------|
+| F32/F16 | ✅ 零拷贝 | `torch.frombuffer` |
+| Q4_0 | ✅ 纯 PyTorch | 位移解包 → FP16 |
+| Q8_0 | ✅ 纯 PyTorch | INT8 缩放 → FP16 |
+
+**4 项零成本优化已内嵌**:
+1. Flash Attention SDPA — 利用 N 卡 Tensor Core
+2. `torch.compile` — 静态图编译抵消初始化开销
+3. TF32 精度 — Ampere+ 架构矩阵乘提速
+4. 动态 Block Size — 根据模型参数量建议最优块大小
 
 ---
 
@@ -97,12 +125,13 @@ python main.py \
 阶段 3: 模块组装
   ├─ attention_kernel.py ─── FlashAttentionKernel (torch.compile)
   ├─ cache_manager.py ────── HybridCache (Paged + Radix)
-  └─ scheduler.py ────────── UnifiedScheduler (双流管线)
+  ├─ scheduler.py ────────── UnifiedScheduler (双流管线)
+  └─ model_loader/ ──────── GGUF 加载 + PyTorch 量化
 
-阶段 4: 模型注入
-  ├─ 加载 HF 模型 (fp16)
-  ├─ 替换每层 self_attn → FlashAttentionKernel
-  └─ 预热编译
+阶段 4: 模型注入 (二选一)
+  ├─ HuggingFace 路径: 加载 HF 模型 (fp16), 替换每层 self_attn → FlashAttentionKernel
+  └─ GGUF 路径: 解析 GGUF 文件, 反量化权重, 构建 GGUFModelAdapter
+  └─ 预热编译 → dummy_input 触发 JIT
 
 阶段 5: 事件循环
   └─ 无限调度: step() → 预填充/解码/同步/GC

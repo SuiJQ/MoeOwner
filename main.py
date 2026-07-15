@@ -67,13 +67,26 @@ configure_global_torch()
 # ---------------------------------------------------------------------------
 
 try:
-    from cache_manager import HybridCache, Block  # noqa: F401
-    from scheduler import UnifiedScheduler, Request, DecodeRequest
+    from cache_manager import Block, HybridCache  # noqa: F401
+    from scheduler import DecodeRequest, Request, UnifiedScheduler  # noqa: F401
     logger.info("Imported cache_manager & scheduler modules")
 except ImportError as exc:
     logger.error("Failed to import engine modules: %s", exc)
     logger.error("Ensure cache_manager.py and scheduler.py are in PYTHONPATH.")
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3b: Import GGUF model loader (optional)
+# ---------------------------------------------------------------------------
+
+_HAS_GGUF = False
+try:
+    from model_loader import load_model as load_gguf_model
+    from model_loader.gguf_reader import GGUFFile as _GGUFFile  # noqa: F401
+    _HAS_GGUF = True
+except ImportError:
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +98,10 @@ def _inject_attention_kernel(layer: torch.nn.Module) -> None:
 
     The actual attention computation is handled by
     ``attention_kernel.FlashAttentionKernel.forward``; this function
-    wires it into an existing HuggingFace decoder layer by monkey‑patching
+    wires it into an existing HuggingFace decoder layer by monkey-patching
     the layer's ``self_attn.forward`` method.
     """
-    from attention_kernel import FlashAttentionKernel
+    from attention_kernel import FlashAttentionKernel  # noqa: PLC0415
 
     attn = getattr(layer, "self_attn", None)
     if attn is None:
@@ -167,7 +180,7 @@ def load_and_inject_model(model_name: str) -> torch.nn.Module:
     torch.nn.Module
         Loaded model in eval mode with custom attention kernels.
     """
-    logger.info("Loading model: %s ...", model_name)
+    logger.info("Loading HuggingFace model: %s ...", model_name)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -193,7 +206,61 @@ def load_and_inject_model(model_name: str) -> torch.nn.Module:
     with torch.no_grad():
         model(dummy_input)
 
-    logger.info("Model loaded, injected, and warmed up.")
+    logger.info("HuggingFace model loaded, injected, and warmed up.")
+    return model
+
+
+def load_and_inject_gguf_model(
+    gguf_path: str,
+    device: str = "cuda",
+    block_size: int | None = None,
+) -> torch.nn.Module:
+    """Load a model from a GGUF file using the pure-Python GGUF reader.
+
+    Parameters
+    ----------
+    gguf_path : str
+        Path to a ``.gguf`` file.
+    device : str
+        Target device (default: cuda).
+    block_size : int or None
+        KV cache block size. If None, dynamically suggested from model size.
+
+    Returns
+    -------
+    GGUFModelAdapter
+        Model adapter ready for the engine scheduler.
+    """
+    if not _HAS_GGUF:
+        raise ImportError(
+            "model_loader not available. Run from pure-python-engine/ dir."
+        )
+
+    # Determine block size dynamically if not specified (optimisation #4)
+    if block_size is None:
+        # Default to 32 for GGUF models (better for larger models)
+        block_size = 32
+
+    logger.info("Loading GGUF model: %s (block_size=%d)", gguf_path, block_size)
+    model = load_gguf_model(
+        path=gguf_path,
+        dtype="fp16",
+        device=device,
+        block_size=block_size,
+    )
+
+    # Log dynamic block-size suggestion
+    est_params = model.estimated_parameter_count_b
+    suggested_bs = model.suggest_block_size(est_params)
+    if suggested_bs != block_size:
+        logger.info(
+            "💡 Suggested block_size=%d for ~%.1fB model "
+            "(current=%d)",
+            suggested_bs, est_params, block_size,
+        )
+
+    logger.info("GGUF model loaded: %d layers, %.1fB params",
+                model.num_layers, est_params)
     return model
 
 
@@ -217,18 +284,27 @@ async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Pure Python Inference Engine — Hybrid Paged+Radix KV Cache"
     )
+    parser = argparse.ArgumentParser(
+        description="Pure Python Inference Engine — Hybrid Paged+Radix KV Cache"
+    )
     parser.add_argument(
         "--model",
         type=str,
-        default=os.environ.get("MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"),
-        help="HuggingFace model name or path (default: $MODEL_NAME or "
-             "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B)",
+        default=os.environ.get("MODEL_NAME", ""),
+        help="HuggingFace model name or local path to GGUF file",
+    )
+    parser.add_argument(
+        "--gguf",
+        type=str,
+        default=None,
+        help="Path to .gguf file (overrides --model if set)",
     )
     parser.add_argument(
         "--block-size",
         type=int,
-        default=16,
-        help="Number of tokens per KV cache block (default: 16)",
+        default=None,
+        help="Number of tokens per KV cache block "
+             "(default: 16 for HF, 32 for GGUF — auto-tuned for model size)",
     )
     parser.add_argument(
         "--hidden-size",
@@ -253,13 +329,26 @@ async def main() -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Stage 4: Load model with injected attention kernels
-    model = load_and_inject_model(args.model)
+    # Stage 4: Load model (GGUF or HuggingFace)
+    if args.gguf or (args.model and args.model.endswith(".gguf")):
+        gguf_path = args.gguf or args.model
+        model = load_and_inject_gguf_model(
+            gguf_path=gguf_path,
+            device="cuda",
+            block_size=args.block_size,
+        )
+        # Extract model dimensions from the GGUF adapter
+        model_hidden_size = model.hidden_size
+        block_size = args.block_size or model.block_size
+    else:
+        model = load_and_inject_model(args.model)
+        model_hidden_size = args.hidden_size
+        block_size = args.block_size or 16
 
     # Stage 3: Create cache and scheduler with the real implementations
     cache = HybridCache(
-        block_size=args.block_size,
-        hidden_size=args.hidden_size,
+        block_size=block_size,
+        hidden_size=model_hidden_size,
         total_blocks=args.total_blocks,
     )
     scheduler = UnifiedScheduler(model, cache)

@@ -20,6 +20,11 @@ env/
 *.swo
 *~
 
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+
 # OS
 .DS_Store
 Thumbs.db

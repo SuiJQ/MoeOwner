@@ -1,0 +1,19 @@
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = [
+    "F", "E", "W", "I", "N", "UP",
+    "SIM", "B", "A", "RUF", "PERF",
+    "PL", "TID", "Q",
+]
+ignore = [
+    "E501", "E731", "W291", "W293",
+    "SIM108", "PLR0913", "PLR0911",
+    "PLR0912", "PLR0915", "PLW0603", "PLW0127",
+    "RUF003",  # ambiguous unicode in comments (× for dimensions OK)
+]
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"test_*.py" = ["PLR2004", "S101", "SIM115"]

@@ -1,4 +1,15 @@
+# === Core engine dependencies ===
 torch==2.6.0+cu124
 transformers==4.51.3
-# fastapi          # 仅 HTTP 接口服务时安装
-# uvicorn[standard] # 仅 HTTP 接口服务时安装
+
+# === GGUF model loader (pure Python, no llama-cpp-python) ===
+# numpy is required by PyTorch and tests
+numpy>=1.24
+
+# === Development & code review ===
+ruff>=0.15.0
+pytest>=9.0.0
+
+# === Optional: HTTP service ===
+# fastapi
+# uvicorn[standard]

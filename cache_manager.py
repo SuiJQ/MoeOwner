@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +20,7 @@ logger = logging.getLogger(__name__)
 class Block:
     """A single KV-cache block descriptor."""
 
-    __slots__ = ("block_id", "physical_address", "token_ids_hash", "ref_count", "next_block_id")
+    __slots__ = ("block_id", "next_block_id", "physical_address", "ref_count", "token_ids_hash")
 
     def __init__(
         self,
@@ -29,7 +28,7 @@ class Block:
         physical_address: int,
         token_ids_hash: str,
         ref_count: int = 1,
-        next_block_id: Optional[int] = None,
+        next_block_id: int | None = None,
     ) -> None:
         self.block_id = block_id
         self.physical_address = physical_address
@@ -61,7 +60,7 @@ class HybridCache:
         self,
         block_size: int = 16,
         hidden_size: int = 4096,
-        total_blocks: Optional[int] = None,
+        total_blocks: int | None = None,
     ) -> None:
         """
         Args:
@@ -81,13 +80,13 @@ class HybridCache:
         self._slot_bytes = self.block_size * self.hidden_size * 2 * 2
 
         # Free-block queue (LIFO for locality).
-        self.free_block_queue: List[int] = list(range(self.total_blocks))
+        self.free_block_queue: list[int] = list(range(self.total_blocks))
 
         # Live block descriptors.
-        self.allocated_blocks: Dict[int, Block] = {}
+        self.allocated_blocks: dict[int, Block] = {}
 
         # Radix index: cumulative-token-hash → block_id.
-        self.radix_index: Dict[str, int] = {}
+        self.radix_index: dict[str, int] = {}
 
         logger.info(
             "HybridCache initialized: block_size=%d, total_blocks=%d, slot_bytes=%d",
@@ -115,7 +114,7 @@ class HybridCache:
             hidden_size: Hidden dimension of the model (used in memory formula).
         """
         try:
-            import torch
+            import torch  # noqa: PLC0415
 
             free_mem, _ = torch.cuda.mem_get_info()  # bytes
             slot_bytes = block_size * hidden_size * 2 * 2
@@ -172,7 +171,7 @@ class HybridCache:
     # Allocation
     # ------------------------------------------------------------------
 
-    def allocate(self, prompt_tokens: List[int]) -> Block:
+    def allocate(self, prompt_tokens: list[int]) -> Block:
         """
         Allocate a new block for the given prompt tokens.
 
@@ -213,7 +212,7 @@ class HybridCache:
         )
         return new_block
 
-    def _incremental_hash_from_tokens(self, tokens: List[int]) -> str:
+    def _incremental_hash_from_tokens(self, tokens: list[int]) -> str:
         """Build the cumulative hex hash for a list of tokens."""
         if not tokens:
             raise ValueError("Cannot hash an empty token list")
@@ -222,7 +221,7 @@ class HybridCache:
             h = self._incremental_hash(h, token)
         return h
 
-    def _register_all_hashes(self, tokens: List[int], block_id: int) -> None:
+    def _register_all_hashes(self, tokens: list[int], block_id: int) -> None:
         """Register every intermediate cumulative hash in radix_index."""
         cumulative = self._hash_single_token(tokens[0])
         self.radix_index[cumulative] = block_id
@@ -235,8 +234,8 @@ class HybridCache:
     # ------------------------------------------------------------------
 
     def match_prefix(
-        self, prompt_tokens: List[int]
-    ) -> Tuple[Optional[int], List[int]]:
+        self, prompt_tokens: list[int]
+    ) -> tuple[int | None, list[int]]:
         """
         Find the longest prefix of ``prompt_tokens`` that exists in the cache.
 
@@ -249,7 +248,7 @@ class HybridCache:
             If nothing matched, ``(None, prompt_tokens)`` is returned.
         """
         cumulative_hash: str = ""
-        last_matched_block_id: Optional[int] = None
+        last_matched_block_id: int | None = None
         split_index = 0
 
         for i, token in enumerate(prompt_tokens):
@@ -332,7 +331,7 @@ class HybridCache:
             Number of entries removed from ``radix_index``.
         """
         removed = 0
-        stale_keys: List[str] = []
+        stale_keys: list[str] = []
 
         for h, bid in self.radix_index.items():
             block = self.allocated_blocks.get(bid)
@@ -365,7 +364,7 @@ class HybridCache:
         """Number of blocks in the free queue."""
         return len(self.free_block_queue)
 
-    def stats(self) -> Dict[str, int]:
+    def stats(self) -> dict[str, int]:
         """Return a snapshot of usage statistics."""
         return {
             "total_blocks": self.total_blocks,

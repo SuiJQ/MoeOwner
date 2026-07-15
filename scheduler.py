@@ -26,16 +26,13 @@ production deployment would need to:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 import torch
 
 import attention_kernel  # noqa: F401 — ensures the module is importable
-
-from cache_manager import HybridCache, Block
+from cache_manager import Block, HybridCache
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +45,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Request:
     """A new incoming request awaiting its first prefill."""
-    prompt_tokens: List[int]
+    prompt_tokens: list[int]
     request_id: str
-    cached_heads: List[int] = field(default_factory=list)
+    cached_heads: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -58,8 +55,8 @@ class DecodeRequest:
     """A request that has been prefilled and is now being decoded
     auto-regressively."""
 
-    tokens: List[int]
-    generated_tokens: List[int]
+    tokens: list[int]
+    generated_tokens: list[int]
     request_id: str
     max_new_tokens: int
     _step_count: int = 0
@@ -119,8 +116,8 @@ class UnifiedScheduler:
         self.decode_stream: torch.cuda.Stream = torch.cuda.Stream()
 
         # Request queues
-        self.waiting_queue: List[Request] = []
-        self.running_requests: List[DecodeRequest] = []
+        self.waiting_queue: list[Request] = []
+        self.running_requests: list[DecodeRequest] = []
 
         # Scheduler flag
         self._running: bool = True
@@ -224,7 +221,7 @@ class UnifiedScheduler:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_cache_from_block(block: Block) -> Optional[object]:
+    def _get_cache_from_block(block: Block) -> object | None:
         """Return the KV cache stored at *block*.
 
         This accessor allows production code to override the lookup strategy
@@ -235,8 +232,8 @@ class UnifiedScheduler:
 
     def _garbage_collect(self) -> None:
         """Release cache blocks belonging to completed requests."""
-        finished: List[DecodeRequest] = []
-        still_running: List[DecodeRequest] = []
+        finished: list[DecodeRequest] = []
+        still_running: list[DecodeRequest] = []
 
         for dreq in self.running_requests:
             if dreq.is_done:
