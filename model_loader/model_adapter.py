@@ -108,14 +108,16 @@ class QuantizedKVCache:
         self.head_dim = head_dim
         self.device = device
 
-        # Pre-allocate INT8 cache buffers
+        # Pre-allocate cache buffers
+        # Key: INT8 per-token quantisation (same as before)
         self.k_cache = torch.zeros(
             max_batch_size, num_heads, max_seq_len, head_dim,
             dtype=torch.int8, device=device,
         )
+        # Value: INT4 with 2-to-1 packing → head_dim/2 in last dim
         self.v_cache = torch.zeros(
-            max_batch_size, num_heads, max_seq_len, head_dim,
-            dtype=torch.int8, device=device,
+            max_batch_size, num_heads, max_seq_len, head_dim // 2,
+            dtype=torch.uint8, device=device,
         )
         # FP16 scale factors
         self.k_scale = torch.ones(max_batch_size, num_heads, max_seq_len, 1,
@@ -141,6 +143,62 @@ class QuantizedKVCache:
         return q, scale.to(torch.float16)
 
     @staticmethod
+    @torch.compile(mode="reduce-overhead", fullgraph=False)
+    def _quantize_value_int4(
+        t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-token INT4 quantisation with 2-to-1 packing.
+
+        Input:  (B, H, T, D) float16, where D = head_dim
+        Output: (B, H, T, D//2) uint8 (packed), (B, H, T, 1) scale
+
+        Packing scheme:
+          Each uint8 byte stores 2 INT4 values with a +8 bias:
+            - Low nibble (bits 0-3):  q0_biased = q0 + 8   (INT4 value at index 2i)
+            - High nibble (bits 4-7): q1_biased = q1 + 8   (INT4 value at index 2i+1)
+          The +8 bias maps signed INT4 range [-8, +7] to unsigned [0, 15],
+          so dequantisation is simply (biased_nibble - 8) * scale.
+        """
+        abs_max = t.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+        scale = abs_max / 7.0  # INT4 symmetric range is ±7 (max representable positive)
+        # Quantise to signed INT4
+        q = (t / scale).round().clamp(-8, 7).to(torch.int8)
+        # Bias to unsigned range [0, 15] for clean nibble storage
+        q_biased = (q + 8).to(torch.uint8)  # q+8 is always in [0, 15] since q∈[-8,+7]
+        # Pack: reshape (B,H,T,D) → (B,H,T,D//2,2) → byte = v0 | (v1 << 4)
+        *rest, d = q_biased.shape
+        d2 = d // 2
+        q_paired = q_biased.view(*rest, d2, 2)
+        packed = q_paired[..., 0] | (q_paired[..., 1] << 4)
+        return packed, scale.to(torch.float16)
+
+    @staticmethod
+    def _dequantize_int4(
+        packed: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Dequantise INT4 packed values → FP16.
+
+        Input:  (..., D//2) uint8 packed, (..., 1) scale
+        Output: (..., D) float16
+
+        Shape-agnostic — works with any leading dimensions (e.g. 3D from read()
+        or 4D from direct kernel calls).
+
+        Each uint8 byte contains 2 biased nibbles:
+          low nibble  = biased_q0 = q0 + 8  →  q0 = nibble - 8
+          high nibble = biased_q1 = q1 + 8  →  q1 = nibble - 8
+          dequant = (nibble - 8) * scale
+        """
+        # Unpack biased nibbles
+        low = (packed & 0xF).to(torch.uint8)      # low nibble  = biased_q0
+        high = ((packed >> 4) & 0xF).to(torch.uint8)  # high nibble = biased_q1
+        # Remove bias and scale back to FP16
+        v0 = (low.to(torch.float16) - 8.0) * scale
+        v1 = (high.to(torch.float16) - 8.0) * scale
+        # Stack and flatten last 2 dims: (..., D//2, 2) → (..., D)
+        return torch.stack([v0, v1], dim=-1).flatten(-2)
+
+    @staticmethod
     def _dequantize(
         q: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
@@ -160,22 +218,25 @@ class QuantizedKVCache:
         v_flat = v.squeeze(0).squeeze(0)
 
         qk, sk = self._quantize_tensor(k_flat.unsqueeze(0))  # (1, H, D), (1, H, 1)
-        qv, sv = self._quantize_tensor(v_flat.unsqueeze(0))
+        qv, sv = self._quantize_value_int4(v_flat.unsqueeze(0))  # (1, H, D//2), (1, H, 1)
 
         self.k_cache[batch_idx, :, position, :] = qk
-        self.v_cache[batch_idx, :, position, :] = qv
+        self.v_cache[batch_idx, :, position, :] = qv.squeeze(0)
         self.k_scale[batch_idx, :, position, :] = sk.squeeze(0)
         self.v_scale[batch_idx, :, position, :] = sv.squeeze(0)
 
     def read(self, batch_idx: int, upto: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dequantise and return (K, V) up to position ``upto``."""
+        """Dequantise and return (K, V) up to position ``upto``.
+
+        K dequant uses INT8 (existing _dequantize), V uses INT4 (_dequantize_int4).
+        """
         k_q = self.k_cache[batch_idx, :, :upto, :]     # (H, T, D)
-        v_q = self.v_cache[batch_idx, :, :upto, :]
+        v_q = self.v_cache[batch_idx, :, :upto, :]     # (H, T, D//2) packed
         k_s = self.k_scale[batch_idx, :, :upto, :]
         v_s = self.v_scale[batch_idx, :, :upto, :]
 
         k = self._dequantize(k_q, k_s)
-        v = self._dequantize(v_q, v_s)
+        v = self._dequantize_int4(v_q, v_s)
         return k, v
 
 

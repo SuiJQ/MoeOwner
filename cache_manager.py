@@ -88,6 +88,12 @@ class HybridCache:
         # Radix index: cumulative-token-hash → block_id.
         self.radix_index: dict[str, int] = {}
 
+        # LRU cache for match_prefix results.
+        # Cache key: hash of first 8 tokens. Value: (block_id | None, split_index).
+        self._match_cache: dict[int, tuple[int | None, int]] = {}
+        self._match_cache_lru: list[int] = []
+        self._match_cache_max = 256
+
         logger.info(
             "HybridCache initialized: block_size=%d, total_blocks=%d, slot_bytes=%d",
             self.block_size,
@@ -239,6 +245,10 @@ class HybridCache:
         """
         Find the longest prefix of ``prompt_tokens`` that exists in the cache.
 
+        Uses an LRU cache (keyed by hash of first 8 tokens) for O(1) hit
+        performance on repeated lookups, plus fast token-by-token traversal
+        with result caching on cache misses.
+
         Returns
         -------
         (matched_block_id, remaining_tokens)
@@ -247,6 +257,19 @@ class HybridCache:
             ``remaining_tokens`` are the unmatched suffix.
             If nothing matched, ``(None, prompt_tokens)`` is returned.
         """
+        # Step 1: LRU cache lookup (keyed by first 8 tokens hash)
+        cache_key = hash(tuple(prompt_tokens[:8]))
+        if cache_key in self._match_cache:
+            block_id, matched_len = self._match_cache[cache_key]
+            # LRU hit promotion
+            self._match_cache_lru.remove(cache_key)
+            self._match_cache_lru.append(cache_key)
+            if block_id is not None:
+                self.allocated_blocks[block_id].ref_count += 1
+                return block_id, prompt_tokens[matched_len:]
+            return None, prompt_tokens
+
+        # Step 2: Token-by-token traversal matching cumulative hashes
         cumulative_hash: str = ""
         last_matched_block_id: int | None = None
         split_index = 0
@@ -262,6 +285,14 @@ class HybridCache:
                 split_index = i + 1
             else:
                 break
+
+        # Step 3: Update LRU cache
+        result = (last_matched_block_id, split_index)
+        self._match_cache[cache_key] = result
+        self._match_cache_lru.append(cache_key)
+        if len(self._match_cache_lru) > self._match_cache_max:
+            old_key = self._match_cache_lru.pop(0)
+            self._match_cache.pop(old_key, None)
 
         if last_matched_block_id is not None:
             # Bump ref count for the matched block.

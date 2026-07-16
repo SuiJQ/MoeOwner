@@ -37,3 +37,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Planning / working docs
+OPTIMIZATION_ROADMAP.md
+
+# Runtime memory notes
+memory/

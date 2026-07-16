@@ -10,10 +10,14 @@ import torch
 
 
 class FlashAttentionKernel:
-    """Compiled flash attention wrapper using PyTorch's native SDPA."""
+    """Compiled flash attention wrapper using PyTorch's native SDPA.
+
+    Uses ``dynamic=True`` so that variable-length inputs do not trigger
+    recompilation — critical for real-world inference with batching.
+    """
 
     @staticmethod
-    @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
+    @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=True)
     def forward(
         q: torch.Tensor,
         k: torch.Tensor,
