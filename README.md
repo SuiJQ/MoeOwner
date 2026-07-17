@@ -1,6 +1,18 @@
 # MoeOwner
 
 > **MoE 异构推理引擎** — 融合 PagedAttention + RadixAttention KV Cache、专家缓存、SERE 推测跳过与 N-Gram 推测解码
+>
+> _🏷️ MoE · LLM Inference · KV Cache · Speculative Decoding · Expert Offloading · GGUF · Pure Python · CUDA · Flash Attention_
+
+---
+
+<p align="center">
+  🌐 <strong>中文</strong> · <a href="#english-version"><strong>English</strong></a>
+</p>
+
+<p align="center">
+  <em>↓ 底部有英文精简版 ↓</em>
+</p>
 
 ---
 
@@ -19,6 +31,8 @@
 | ⚡ **SERE** | `sere.py` | 动态专家跳过，top-k 后重路由 |
 | 🔮 **推测解码** | `ngram_speculation.py` | CPU Trie N-Gram 推测解码 |
 
+> **关键词**：MoE推理 | 大模型加速 | 混合KV缓存 | 专家卸载 | FlashAttention | 推测解码 | 双流管线 | PyTorch | GGUF | 纯Python
+
 ### 核心技术
 
 - **增量 SHA-256 哈希链**：严格 `SHA256(SHA256(prev).digest() + token_bytes)`，非 `hashlib.update()`，保证 Radix 树可匹配任意前缀
@@ -29,7 +43,7 @@
 - **纯 Python GGUF 解析器**：仅依赖 struct+mmap+PyTorch，无需 llama-cpp-python
 - **原生量化加载**：Q4_0/Q8_0 纯 PyTorch bitwise 反量化，零 C 扩展
 - **KV Cache 非对称量化**：Key→INT8 + **Value→INT4 位运算打包**，显存降至 FP16 的 37.5%
-- **LRU 前缀匹配缓存**：`match_prefix` 增加 hash-based LRU (max 256 条目)，重复前缀 **O(1)** 命中
+- **LRU 前缀匹配缓存**：`match_prefix` 增加 hash-based LRU（max 256 条目），重复前缀 **O(1)** 命中
 
 ---
 
@@ -40,9 +54,9 @@
 | 层级 | 介质 | 容量 | 延迟 |
 |------|------|------|------|
 | L1 | GPU HBM | ~few GB | ~μs |
-| L2 | CPU Pinned Memory | ~数十 GB | ~ms (后台异步传输) |
+| L2 | CPU Pinned Memory | ~数十 GB | ~ms（后台异步传输） |
 
-- LRU-Frequency-Reuse (LFRU) 驱逐策略：综合访问频率、上次访问时间、重用距离
+- LRU-Frequency-Reuse（LFRU）驱逐策略：综合访问频率、上次访问时间、重用距离
 - 异步 D2H/H2D 传输，不阻塞 decode 流水线
 - 支持引用计数，避免逐出正在使用的专家
 
@@ -55,8 +69,8 @@
 ### 3. N-Gram 推测解码 (`ngram_speculation.py`)
 
 - CPU 端 Trie 树存储历史 N-Gram 频率
-- 每步推测 3-5 个候选 token，批量验证
-- 推测命中率 40-70%（取决于模型与任务）
+- 每步推测 3–5 个候选 token，批量验证
+- 推测命中率 40–70%（取决于模型与任务）
 
 ### 4. 调度器三阶段管线
 
@@ -140,7 +154,8 @@ model_loader/
 | Q4_0 | ✅ 纯 PyTorch | 位移解包 → FP16 |
 | Q8_0 | ✅ 纯 PyTorch | INT8 缩放 → FP16 |
 
-**零成本优化已内嵌**:
+**零成本优化已内嵌**：
+
 - Flash Attention v2 SDPA — 利用 N 卡 Tensor Core（强制启用，禁用 math/mem_efficient 回退）
 - cuDNN benchmark — 运行时自动调优卷积/注意力 kernel
 - `torch.compile(dynamic=True)` — 静态图编译 + 可变长度输入不触发重编译
@@ -172,7 +187,7 @@ model_loader/
   ├─ ngram_speculation.py ─── N-Gram 推测解码
   └─ model_loader/ ────────── GGUF 加载 + PyTorch 量化
 
-阶段 4: 模型注入 (二选一)
+阶段 4: 模型注入（二选一）
   ├─ HuggingFace 路径: 加载 HF 模型 (fp16), 替换每层 self_attn → FlashAttentionKernel
   └─ GGUF 路径: 解析 GGUF 文件, 反量化权重, 构建 GGUFModelAdapter
   └─ 预热编译 → dummy_input 触发 JIT
@@ -214,7 +229,7 @@ model_loader/
                │  Decode 1  │                  ← decode_stream
                └────────────┘
 
-  同步点: torch.cuda.synchronize()  ← 主线程 (仅此处)
+  同步点: torch.cuda.synchronize()  ← 主线程（仅此处）
 ```
 
 ---
@@ -227,6 +242,7 @@ python3 -m pytest tests/ -v
 ```
 
 当前通过 **35 项**自动化测试：
+
 - ✅ 块分配与空闲队列管理
 - ✅ 增量哈希链一致性
 - ✅ Radix 前缀匹配（精确/部分/无匹配）
@@ -245,12 +261,13 @@ python3 -m pytest tests/ -v
 
 ## 注意事项
 
-⚠️ **集成注意事项**：
+> ⚠️ 以下为使用 MoeOwner 时需留意的已知约束与边界情况。**注意：README 中的前两条注解曾标记为"占位实现"，代码已于 v2 完成全链路集成，此处为最新状态说明。**
 
-1. **`past_key_values` 集成**：当前调度器的 `model.forward()` 调用中的 `past_key_values` 是占位实现。需实现自定义 `DynamicCache` 子类，从 `HybridCache` 的物理块池读写 KV 张量
-2. **解码路径**：`scheduler.step()` 中的解码路径目前是一个生命周期钩子（`decode_req.step()`），实际的 `model.forward()` 调用需补充
-3. **CUDA 图捕获**：`torch.compile(mode="reduce-overhead")` 在首次运行时会有编译开销
-4. **Expert Cache + CUDA Graph 互斥**：专家缓存启用时自动禁用 CUDA Graph
+1. **KV Cache 全链路已集成** ✅：调度器 `_decode_step()` 从 `HybridCache.load_kv()` 读取缓存的 KV 张量，传入 `model.forward(past_key_values=...)`，解码后通过 `cache.store_kv()` 写回。每步 decode 仅传入 1 个 token + 其缓存的KV，实现 O(n) 逐 token 注意力，而非全量重算。完成请求自动 `free_block()` 回收。
+2. **解码路径完整** ✅：`_decode_step()` 正确调用 `model.forward()` 获取 logits 并通过 `argmax` 采样下一个 token。`decode_req.step()` 仅用做步数计数器，不替代实际模型前向。
+3. **CUDA 图捕获编译开销** 🔧：`torch.compile(mode="reduce-overhead")` 在首次运行时会有编译开销（通常数十秒），后续调用为静态图执行。可通过 `TORCH_COMPILE_DEBUG=1` 观察编译详情。
+4. **Expert Cache 与 CUDA Graph 互斥** 🔒：专家缓存启用时自动禁用 CUDA Graph（`init_cuda_graphs()` 中检测），因为动态权重加载使静态图失效。
+5. **模型适配层要求** 📋：当前 `model.forward()` 的 `use_cache=True` 路径依赖模型将新 KV 返回至 `model._last_kv_cache` 属性。HF Transformers 模型默认支持；自定义模型需包装此接口。
 
 ---
 
@@ -264,3 +281,96 @@ python3 -m pytest tests/ -v
 - ✅ **贡献代码** — 提交者自动授权项目使用
 
 **完整许可文本见 [LICENSE](./LICENSE)**
+
+---
+
+<a id="english-version"></a>
+
+# MoeOwner — _English_
+
+> **Heterogeneous MoE Inference Engine** — Integrating PagedAttention + RadixAttention KV Cache, Expert Offloading, SERE Dynamic Expert Skipping, and N-Gram Speculative Decoding.
+>
+> _🏷️ Tags: MoE · LLM Inference · KV Cache · Speculative Decoding · Expert Offloading · GGUF · Pure Python · CUDA · Flash Attention · PyTorch_
+
+A production-oriented inference engine purpose-built for **Mixture-of-Experts** large language models. It fuses classic KV cache management with MoE-specific optimizations in a single, cohesive pipeline.
+
+## Key Features
+
+| Module | File | Role |
+|--------|------|------|
+| 🔥 FlashAttention Kernel | `attention_kernel.py` | Optimized PyTorch SDPA + `torch.compile` attention |
+| 📦 Hybrid Cache | `cache_manager.py` | PagedAttention physical blocks + RadixAttention hash index |
+| ⏱ Unified Scheduler | `scheduler.py` | Chunked Prefill + Decode dual-CUDA-stream pipeline |
+| 🚀 Entrypoint | `main.py` | Global config, model injection, event loop, HTTP API server |
+| 📖 GGUF Loader | `model_loader/` | Pure Python GGUF v3 parser — no llama-cpp-python required |
+| 🧠 Expert Cache | `expert_cache.py` | Hierarchical LFRU expert weight offloading (DRAM + VRAM) |
+| ⚡ SERE | `sere.py` | Dynamic expert skipping via post-routing logit redirection |
+| 🔮 N-Gram Speculation | `ngram_speculation.py` | CPU Trie-based draft generation + verification |
+
+### Core Technologies
+
+- **Incremental SHA-256 hash chain** — `SHA256(SHA256(prev).digest() + token)` enables arbitrary prefix matching in the Radix tree
+- **VRAM-aware capacity** — `total_blocks = int(free_mem * 0.85 / (block_size * hidden_size * 4))`
+- **Compound-key GC guard** — prevents accidental eviction due to hash collisions
+- **Dual CUDA streams** — prefill and decode run concurrently; main thread synchronizes at checkpoint
+- **Reference-counted eviction** — each prefix match increments ref_count; blocks recycled at 0
+- **Pure Python GGUF parser** — depends only on `struct` + `mmap` + PyTorch
+- **Native quantization** — Q4_0/Q8_0 bitwise dequantization in pure PyTorch, zero C extensions
+- **KV Cache asymmetric quantization** — Key→INT8 + Value→INT4 packed, reducing memory to 37.5% of FP16
+- **LRU prefix match cache** — hash-based LRU (max 256 entries), **O(1)** for repeated prefixes
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+pip install transformers==4.51.3
+
+# Run tests
+python3 -m pytest tests/ -v
+
+# Start inference engine with HuggingFace model
+python main.py --model Qwen/Qwen2.5-1.5B-Instruct --api-port 8000
+
+# Or with a GGUF model
+python main.py --gguf /path/to/model.Q4_0.gguf --block-size 32 --verbose
+```
+
+## Architecture Overview
+
+```
+Input → [Scheduler Layer] → [Cache Layer] → [Inference Layer] → Output
+         Prefill Scheduling   KV Cache Mgmt     MoE Forward
+         Decode Scheduling    LRU Eviction      Expert Cache
+         Speculation          Radix Match       SERE Skip
+
+Stream Pipeline:
+  ┌─────────┐  ┌─────────┐  ┌─────────┐
+  │ Prefill  │  │ Prefill  │  │ Prefill  │  ← prefill_stream
+  │ Chunk 1  │  │ Chunk 2  │  │ Chunk 3  │
+  └─────────┘  └────┬────┘  └─────────┘
+                     │
+               ┌─────▼──────┐
+               │  Decode 1  │                ← decode_stream
+               └────────────┘
+      Sync: torch.cuda.synchronize() — main thread only
+```
+
+## Integration Notes
+
+1. ✅ **KV Cache integration**: Fully wired. `_decode_step()` loads KV from `HybridCache.load_kv()`, passes to `model.forward(past_key_values=...)`, and stores updated KV via `cache.store_kv()`. Each decode step processes 1 token with O(n) attention using cached KV.
+2. ✅ **Decode path**: Complete. `model.forward()` is called per step with logits extracted via `argmax`. `decode_req.step()` is purely a step counter.
+3. 🔧 **CUDA Graph warmup**: `torch.compile(mode="reduce-overhead")` incurs ~tens-of-seconds compilation on first run; subsequent calls are static graph execution. Set `TORCH_COMPILE_DEBUG=1` for compilation details.
+4. 🔒 **Expert Cache ↔ CUDA Graph mutual exclusion**: When expert cache is active, CUDA Graphs are automatically disabled (`init_cuda_graphs()` detects this), because dynamic weight loading invalidates static graphs.
+5. 📋 **Model adapter requirement**: `use_cache=True` path requires the model to store new KV pairs on `model._last_kv_cache`. HF Transformers support this natively; custom models need a thin wrapper.
+
+## License
+
+**CC BY-NC-SA 4.0** — Attribution-NonCommercial-ShareAlike 4.0 International
+
+- ✅ **Research & learning** — Welcome
+- ✅ **Modification & distribution** — Permitted under same license
+- ❌ **Commercial use** — Prohibited
+- ✅ **Contributions** — Contributors automatically license their work for project use
+
+Full license text: [LICENSE](./LICENSE)
