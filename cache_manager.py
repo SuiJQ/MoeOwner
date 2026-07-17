@@ -319,6 +319,10 @@ class HybridCache:
                         kv = child_block.kv_tensor
                         if kv is None:
                             continue
+                        # kv is now a list[tuple[tensor, tensor]]; skip prefetch
+                        # (HybridCache prefetch only supports single-Tensor blocks)
+                        if isinstance(kv, list):
+                            continue
                         if kv.device.type != "cuda":
                             _ = kv.to(device="cuda", non_blocking=True)
         except RuntimeError as _rexc:

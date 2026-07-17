@@ -16,6 +16,17 @@ logger = logging.getLogger(__name__)
 _MIN_NGRAM_LEN = 2
 
 
+def _extract_logits(model_output):
+    """Extract logits tensor from raw tensor or HF CausalLMOutput."""
+    if isinstance(model_output, torch.Tensor):
+        return model_output
+    if hasattr(model_output, "logits"):
+        return model_output.logits
+    if isinstance(model_output, (tuple, list)):
+        return model_output[0]
+    return model_output
+
+
 class NGramTrieNode:
     __slots__ = ("children", "count")
 
@@ -182,7 +193,8 @@ class SpeculativeGenerator:
     def decode(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, int, int]:
         if not self.enabled:
             with torch.no_grad():
-                logits = self.model(input_ids)
+                raw = self.model(input_ids)
+            logits = _extract_logits(raw)
             next_tok = logits[0, -1, :].argmax().item()
             new_ids = torch.cat(
                 [input_ids, torch.tensor([[next_tok]], device=input_ids.device)], dim=-1
@@ -193,7 +205,8 @@ class SpeculativeGenerator:
         drafts = self.ngram_cache.generate_draft(context, self.max_draft)
         if not drafts:
             with torch.no_grad():
-                logits = self.model(input_ids)
+                raw = self.model(input_ids)
+            logits = _extract_logits(raw)
             next_tok = logits[0, -1, :].argmax().item()
             new_ids = torch.cat(
                 [input_ids, torch.tensor([[next_tok]], device=input_ids.device)], dim=-1
@@ -204,13 +217,14 @@ class SpeculativeGenerator:
         extended = torch.cat([input_ids, draft_tensor], dim=-1)
 
         with torch.no_grad():
-            logits = self.model(extended)
+            raw = self.model(extended)
+        logits_t = _extract_logits(raw)
 
         context_len = input_ids.shape[1]
-        accepted, num_accepted = NGramCache.verify_drafts(logits, drafts, context_len)
+        accepted, num_accepted = NGramCache.verify_drafts(logits_t, drafts, context_len)
 
         accept_pos = context_len + num_accepted
-        next_tok = logits[0, accept_pos, :].argmax().item()
+        next_tok = logits_t[0, accept_pos, :].argmax().item()
 
         new_tokens = [*accepted, next_tok]
         new_ids = torch.cat(

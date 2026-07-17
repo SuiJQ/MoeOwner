@@ -110,6 +110,11 @@ def _inject_attention_kernel(layer: torch.nn.Module) -> None:
         k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
 
+        # Concatenate cached KV for incremental decode (O(n) attention)
+        if past_key_value is not None:
+            k = torch.cat([past_key_value[0], k], dim=2)
+            v = torch.cat([past_key_value[1], v], dim=2)
+
         softmax_scale = head_dim**-0.5
         attn_output = FlashAttentionKernel.forward(
             q,
@@ -122,7 +127,10 @@ def _inject_attention_kernel(layer: torch.nn.Module) -> None:
         attn_output = attn_output.view(batch_size, seq_len, -1)
         attn_output = attn_output.to(hidden_states.dtype)
         attn_output = attn.o_proj(attn_output)
-        return (attn_output, None)
+
+        # Return new KV pair for cache
+        new_kv = (k, v) if use_cache else None
+        return (attn_output, new_kv)
 
     attn.forward = _patched_forward
     attn.is_causal = True

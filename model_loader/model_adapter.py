@@ -468,6 +468,7 @@ class GGUFModelAdapter(nn.Module):
         self.num_experts = 0
         self.num_experts_per_tok = 0
         self.is_moe = False
+        self.intermediate_size = 0  # set during _build_model
         self._params_loaded = False
 
     def load(self):
@@ -580,6 +581,12 @@ class GGUFModelAdapter(nn.Module):
                 )
             layer_list.append(layer)
         self.layers = nn.ModuleList(layer_list)
+
+        # Set adapter-level intermediate_size from the first MoE layer
+        for ly in layer_list:
+            if hasattr(ly, "intermediate_size"):
+                self.intermediate_size = ly.intermediate_size
+                break
 
         self.norm_weight = w.get("output_norm.weight")
         if self.norm_weight is not None:

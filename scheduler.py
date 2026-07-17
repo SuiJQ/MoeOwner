@@ -25,6 +25,24 @@ from cache_manager import HybridCache
 logger = logging.getLogger(__name__)
 
 
+def _extract_logits(model_output) -> torch.Tensor:
+    """Extract logits tensor from both raw tensor and HF CausalLMOutput."""
+    if isinstance(model_output, torch.Tensor):
+        return model_output
+    if hasattr(model_output, "logits"):
+        return model_output.logits
+    if isinstance(model_output, (tuple, list)):
+        return model_output[0]
+    return model_output
+
+
+def _extract_past_key_values(model_output):
+    """Extract past_key_values from HF output or GGUF-side-effect."""
+    if hasattr(model_output, "past_key_values"):
+        return model_output.past_key_values
+    return None
+
+
 @dataclass
 class Request:
     prompt_tokens: list[int]
@@ -364,13 +382,15 @@ class UnifiedScheduler:
             inp = torch.tensor([tokens], dtype=torch.long, device="cuda")
 
             with torch.cuda.stream(self.prefill_stream), torch.no_grad():
-                _ = self.model.forward(
+                out = self.model.forward(
                     input_ids=inp,
                     use_cache=True,
                 )
 
-            # Retrieve KV cache from model (stored in _last_kv_cache)
+            # Retrieve KV cache (GGUF side-effect or HF output)
             kv_cache = getattr(self.model, "_last_kv_cache", None)
+            if kv_cache is None:
+                kv_cache = _extract_past_key_values(out)
             if kv_cache is not None:
                 # Allocate a cache block for this request
                 cache_block = self.cache.allocate(tokens)
@@ -416,9 +436,16 @@ class UnifiedScheduler:
             self._decode_bs = 0
             return
 
-        # -- Speculative decode (request 0 only) --
+        # -- Speculative decode (request 0 only, only when CUDA Graphs active) --
         spec_advanced = 0
-        if self._spec_gen and len(self.active_decode_pool) >= 1:
+        _spec_eligible = (
+            self._spec_gen
+            and len(self.active_decode_pool) >= 1
+            and self._cuda_graph_mgr is not None
+            and not self._KV_CACHE_ENABLED
+            and self._expert_cache is None
+        )
+        if _spec_eligible:
             main_req = self.active_decode_pool[0]
             ctx_list = main_req.tokens
             if len(ctx_list) > 0:
@@ -446,7 +473,7 @@ class UnifiedScheduler:
 
                 with torch.no_grad():
                     if past_kv is not None and self._KV_CACHE_ENABLED:
-                        logits = self.model.forward(
+                        model_out = self.model.forward(
                             input_ids=inp,
                             past_key_values=past_kv,
                             use_cache=True,
@@ -456,36 +483,36 @@ class UnifiedScheduler:
                         full_input = torch.tensor(
                             [req.tokens], dtype=torch.long, device="cuda"
                         )
-                        logits = self.model.forward(
+                        model_out = self.model.forward(
                             input_ids=full_input, use_cache=False
                         )
 
+                # Extract logits (works for both GGUF tensor and HF output)
+                logits_t = _extract_logits(model_out)
+
                 # Extract next token
                 _min_logit_dims = 2
-                if isinstance(logits, torch.Tensor) and logits.dim() >= _min_logit_dims:
-                    next_tok = int(logits[0, -1, :].argmax().item())
+                if logits_t.dim() >= _min_logit_dims:
+                    next_tok = int(logits_t[0, -1, :].argmax().item())
                 else:
-                    # Might be a tuple/model output
-                    next_tok = int(
-                        logits[0, -1, :].argmax().item()
-                        if hasattr(logits, "__getitem__")
-                        else 0
-                    )
+                    next_tok = 0
 
                 req.step()
                 req.generated_tokens.append(next_tok)
                 req.tokens.append(next_tok)
 
-                # Update KV cache after decode
+                # Update KV cache after decode (both GGUF and HF paths)
                 if req.cache_block_id is not None and self._KV_CACHE_ENABLED:
                     new_kv = getattr(self.model, "_last_kv_cache", None)
+                    if new_kv is None:
+                        new_kv = _extract_past_key_values(model_out)
                     if new_kv is not None:
                         self.cache.store_kv(req.cache_block_id, new_kv)
 
                 # Confidence-based k adjustment on request 0
-                if self._dynamic_activator is not None and i == 0 and isinstance(logits, torch.Tensor):
+                if self._dynamic_activator is not None and i == 0:
                     self._dynamic_activator.update_from_logits(
-                            logits[None, :, :],
+                            logits_t[None, :, :],
                             generated_ids=req.tokens,
                             detokenizer=self._detokenizer,
                         )
