@@ -4,6 +4,7 @@ UnifiedScheduler — Three-Layer End-to-End MoE Inference Pipeline.
 
 from __future__ import annotations
 
+import collections.abc
 import logging
 import time
 from dataclasses import dataclass, field
@@ -122,9 +123,15 @@ class UnifiedScheduler:
     _PREFILL_BATCH_MAX = 8
     _EXPERT_CAPACITY_FACTOR = 1.2
 
-    def __init__(self, model: object, cache: HybridCache) -> None:
+    def __init__(
+        self,
+        model: object,
+        cache: HybridCache,
+        detokenizer: collections.abc.Callable[[list[int]], str] | None = None,
+    ) -> None:
         self.model = model
         self.cache = cache
+        self._detokenizer = detokenizer
 
         self.prefill_stream = torch.cuda.Stream()
         self.decode_stream = torch.cuda.Stream()
@@ -142,6 +149,10 @@ class UnifiedScheduler:
         self._sere = None
         self._expert_cache = None
         self._batch_plan = None
+
+        # [Speculative Prefetch & Dynamic Expert Activation]
+        self._dynamic_activator = None
+        self._spec_prefetcher = None
 
         logger.info(
             "UnifiedScheduler: chunk=%d, batch_max=%d, cap_factor=%.2f",
@@ -161,6 +172,30 @@ class UnifiedScheduler:
             self._ngram_cache = NGramCache(max_n=5, max_nodes=100000)
             self._spec_gen = SpeculativeGenerator(
                 model=self.model, ngram_cache=self._ngram_cache, max_draft=5, enabled=True
+            )
+
+    def _init_speculative_prefetch(self):
+        """Lazy init DynamicExpertActivator + SpeculativePrefetcher."""
+        from speculative_prefetch import (  # noqa: PLC0415
+            DynamicExpertActivator,
+            SpeculativePrefetcher,
+        )
+
+        if self._dynamic_activator is None:
+            # All tunable parameters use the class defaults — no manual overrides.
+            self._dynamic_activator = DynamicExpertActivator(
+                sere_module=self._sere,
+            )
+
+        if self._spec_prefetcher is None and self._ngram_cache is not None:
+            num_layers = getattr(self.model, "num_layers", 0)
+            num_experts = getattr(self.model, "num_experts", 8)
+            self._spec_prefetcher = SpeculativePrefetcher(
+                ngram_cache=self._ngram_cache,
+                expert_cache=self._expert_cache,
+                sere_module=self._sere,
+                num_layers=num_layers,
+                num_experts=num_experts,
             )
 
     def _get_decoder_layers(self):
@@ -283,6 +318,8 @@ class UnifiedScheduler:
 
     def shutdown(self) -> None:
         self._running = False
+        if self._spec_prefetcher is not None:
+            self._spec_prefetcher.shutdown()
 
     # ==================================================================
     # Prefill
@@ -396,13 +433,30 @@ class UnifiedScheduler:
                 logits = mgr.replay(batch_size=self._decode_bs, input_ids=input_ids)
                 next_token_ids = logits[:, -1, :].argmax(dim=-1)
 
+                # [Dynamic Expert Activation] confidence-based k adjustment
+                if self._dynamic_activator is not None:
+                    # Use the first active request's logit as the confidence signal
+                    self._dynamic_activator.update_from_logits(
+                        logits[:1, :, :],
+                        generated_ids=self.active_decode_pool[0].tokens if current_count > 0 else None,
+                        detokenizer=self._detokenizer,
+                    )
+
                 for i in range(current_count):
                     req = self.active_decode_pool[i]
                     if i == 0 and spec_advanced > 0:
                         continue
                     req.step()
-                    req.generated_tokens.append(int(next_token_ids[i].item()))
-                    req.tokens.append(int(next_token_ids[i].item()))
+                    tok = int(next_token_ids[i].item())
+                    req.generated_tokens.append(tok)
+                    req.tokens.append(tok)
+
+                # [Speculative Prefetch] trigger next-step prediction
+                if self._spec_prefetcher is not None and current_count > 0:
+                    self._spec_prefetcher.step(
+                        context_ids=self.active_decode_pool[0].tokens,
+                        transfer_stream=self.transfer_stream,
+                    )
             else:
                 # [Fix 2] Direct forward (no CUDA Graph or expert cache active).
                 for i, req in enumerate(self.active_decode_pool):
@@ -415,6 +469,21 @@ class UnifiedScheduler:
                     req.step()
                     req.generated_tokens.append(next_tok)
                     req.tokens.append(next_tok)
+
+                    # [Dynamic Expert Activation] per-token confidence adjustment
+                    if self._dynamic_activator is not None and i == 0:
+                        self._dynamic_activator.update_from_logits(
+                            logits[None, :, :],  # [1, seq, vocab]
+                            generated_ids=req.tokens,
+                            detokenizer=self._detokenizer,
+                        )
+
+                # [Speculative Prefetch] trigger after all requests processed
+                if self._spec_prefetcher is not None and current_count > 0:
+                    self._spec_prefetcher.step(
+                        context_ids=self.active_decode_pool[0].tokens,
+                        transfer_stream=self.transfer_stream,
+                    )
 
     # ==================================================================
     # Main step [Fix 2] expert cache before CUDA graphs
@@ -434,6 +503,10 @@ class UnifiedScheduler:
             self._init_ngram()
         if self._sere is None and getattr(self.model, "is_moe", False):
             self._init_sere()
+
+        # [Speculative Prefetch] init after ngram + sere + expert_cache ready
+        if self._dynamic_activator is None or self._spec_prefetcher is None:
+            self._init_speculative_prefetch()
 
         self._decode_step()
 

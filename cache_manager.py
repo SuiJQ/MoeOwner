@@ -152,6 +152,9 @@ class HybridCache:
 
         [Bug 2] Uses set[int] in radix_index so shared prefixes don't collide.
         """
+        if not prompt_tokens:
+            raise ValueError("allocate() requires at least one token")
+
         free = self.free_block_queue
         blocks = self.allocated_blocks
         radix = self.radix_index
@@ -215,9 +218,15 @@ class HybridCache:
                 block = blocks.get(block_id)
                 if block is not None:
                     block.ref_count += 1
-                if matched_len == len(prompt_tokens) and block is not None:
-                    self._try_prefetch_children(block)
-                return block_id, prompt_tokens[matched_len:]
+                if block is None:
+                    # Stale cache entry — block was freed; invalidate and fall
+                    # through to the fresh lookup path below.
+                    match_cache.pop(cache_key, None)
+                    match_lru.remove(cache_key)
+                else:
+                    if matched_len == len(prompt_tokens):
+                        self._try_prefetch_children(block)
+                    return block_id, prompt_tokens[matched_len:]
             return None, prompt_tokens
 
         cumulative_hash: str = ""
@@ -307,10 +316,10 @@ class HybridCache:
                             continue
                         if kv.device.type != "cuda":
                             _ = kv.to(device="cuda", non_blocking=True)
-        except RuntimeError:
-            pass
-        except Exception:
-            pass
+        except RuntimeError as _rexc:
+            logger.warning("_try_prefetch_children RuntimeError: %s", _rexc)
+        except Exception as _eexc:
+            logger.warning("_try_prefetch_children unexpected error: %s", _eexc)
 
     # ------------------------------------------------------------------
     # Free / reference-count management

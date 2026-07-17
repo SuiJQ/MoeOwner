@@ -6,7 +6,11 @@ GQA support.  Falls back gracefully when ``enable_gqa`` is not
 available on older PyTorch builds.
 """
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class FlashAttentionKernel:
@@ -16,8 +20,8 @@ class FlashAttentionKernel:
     recompilation — critical for real-world inference with batching.
     """
 
-    @staticmethod
     @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=True)
+    @staticmethod
     def forward(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -54,8 +58,13 @@ class FlashAttentionKernel:
                 is_causal=causal,
                 enable_gqa=True,
             )
-        except (RuntimeError, ValueError):
+        except (RuntimeError, ValueError) as _exc:
             # PyTorch < 2.6 or non-GQA head counts may reject enable_gqa.
+            logger.warning(
+                "SDPA with enable_gqa failed (%s: %s), falling back to standard SDPA",
+                type(_exc).__name__,
+                _exc,
+            )
             return torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
