@@ -575,6 +575,7 @@ class UnifiedScheduler:
         1. Truncate token list to tokens[:4] + tokens[-2048:]
         2. Slice KV tensors to match (keep first 4 + last 2048 positions)
         3. Free any intermediate KV blocks via existing pop interface
+        4. [AFCE] Clear orphan sidecar anchors before compression
         """
         if req.cache_block_id is None or not req.tokens:
             return
@@ -583,6 +584,13 @@ class UnifiedScheduler:
         if old_len <= 2052:
             # Too short to need compression
             return
+
+        # [AFCE] Clear orphan sidecar for old hash — token sequence will
+        # change after compression, leaving stale anchors unreachable.
+        if self._afce_manager is not None:
+            old_hash = self.cache.compute_hash(req.tokens)
+            if old_hash and self._afce_manager.has_sidecar(old_hash):
+                self._afce_manager.remove_sidecar(old_hash)
 
         # Build new token sequence
         new_tokens = req.tokens[:4] + req.tokens[-2048:]
@@ -647,10 +655,32 @@ class UnifiedScheduler:
             # ---- Step 3: Load prefix KV cache ----
             past_kv = None
             prefix_len = 0
+            _goose_afce_anchors: int = 0
             if req.cache_block_id is not None and self._KV_CACHE_ENABLED:
                 past_kv = self.cache.load_kv(req.cache_block_id)
                 if past_kv is not None and len(past_kv) > 0 and past_kv[0][0] is not None:
                     prefix_len = past_kv[0][0].shape[2]
+
+                # [AFCE] Extend KV with anchors for long-context speculative
+                # quality.  The forward inside verify uses is_causal=True which
+                # naturally allows attending to prepended anchors (whose abs
+                # positions are all < query position).
+                if self._afce_manager is not None:
+                    _gk = self.cache.compute_hash(context)
+                    if _gk and self._afce_manager.has_sidecar(_gk):
+                        _ext: list[tuple[torch.Tensor, torch.Tensor]] = []
+                        _an = 0
+                        for _k, _v in past_kv:
+                            _ek, _ev, _m, _n = self._afce_manager.extend_for_decode(
+                                _gk, _k, _v, len(context) - 1,
+                            )
+                            _ext.append((_ek, _ev))
+                            _an = _n
+                        if _an > 0:
+                            _goose_afce_anchors = _an
+                            # Adjust prefix_len: anchors are prepended
+                            prefix_len += _an
+                            past_kv = _ext
 
             # ---- Step 4: Verify ----
             with torch.cuda.stream(spec_stream), torch.no_grad():
@@ -687,6 +717,11 @@ class UnifiedScheduler:
 
             # Update KV cache (sliced to accepted prefix)
             if new_kv is not None and req.cache_block_id is not None:
+                # [AFCE] Strip anchor positions from speculative output
+                if _goose_afce_anchors > 0 and self._afce_manager is not None:
+                    new_kv = self._afce_manager.strip_anchors_from_kv(
+                        new_kv, _goose_afce_anchors,
+                    )
                 self.cache.store_kv(req.cache_block_id, new_kv)
 
             # Update static KV (for non-cache forward tracking)
@@ -746,11 +781,14 @@ class UnifiedScheduler:
         # Clear speculation tracking
         self._spec_handled.clear()
 
-        # Sync streams
+        # Establish cross-stream ordering for next step.
+        # wait_stream sets a GPU-side dependency (CPU returns immediately).
+        # No full synchronize() here — it would stall the async pipeline
+        # by idling the GPU between decode steps.  The targeted sync lives
+        # inside _garbage_collect where actual memory freeing occurs.
         torch.cuda.current_stream().wait_stream(self.prefill_stream)
         torch.cuda.current_stream().wait_stream(self.decode_stream)
         torch.cuda.current_stream().wait_stream(self.transfer_stream)
-        torch.cuda.synchronize()
 
         self._garbage_collect()
 
@@ -760,6 +798,15 @@ class UnifiedScheduler:
 
     def _garbage_collect(self):
         finished = [d for d in self.active_decode_pool if d.is_done]
+        if not finished:
+            # Nothing to free — skip expensive sync
+            self.active_decode_pool = [d for d in self.active_decode_pool if not d.is_done]
+            self.cache.gc()
+            return
+
+        # Targeted sync: ensure no GPU kernel references blocks we're freeing
+        torch.cuda.synchronize()
+
         for d in finished:
             logger.info(
                 "Request %s complete (%d tokens)",

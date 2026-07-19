@@ -88,4 +88,8 @@ class SEREModule:
                 skipped_count / total_slots * 100,
             )
 
+        # OEF suggestions are one-shot — consume and clear immediately
+        # to prevent stale suggestions from leaking across steps.
+        self._oef_skip_suggestions = None
+
         return selected_probs, top_k_indices, None
